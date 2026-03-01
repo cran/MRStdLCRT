@@ -10,25 +10,52 @@
   estimand = NULL,
   digits = 6,
   show_counts = TRUE,
+  ics = "global",
+  ics_method = c("both", "unadjusted", "adjusted"),
+  ics_tol = 1e-10,
   ...
 )
 }
 \arguments{
 \item{object}{An object of class \code{"mrs"}.}
 
-\item{level}{Confidence level.}
+\item{level}{Confidence level for Wald-type confidence intervals.}
 
-\item{estimand}{Optional subset of estimands.}
+\item{estimand}{Optional subset of estimands to print.}
 
 \item{digits}{Digits to print.}
 
-\item{show_counts}{Print counts tables.}
+\item{show_counts}{If \code{TRUE}, print aggregation counts tables.}
 
-\item{...}{Unused.}
+\item{ics}{ICS test specification. Use \code{"global"} (default) or \code{"none"} to disable.
+You may also pass a character vector, list spec, or numeric contrast matrix.}
+
+\item{ics_method}{Which covariance to use for ICS test: \code{"both"}, \code{"unadjusted"}, \code{"adjusted"}.}
+
+\item{ics_tol}{Numerical tolerance for rank / generalized inverse.}
+
+\item{...}{Unused (accepts \code{method_type=} as alias for \code{ics_method=}).}
 }
 \value{
-Invisibly returns a list of printed tables and metadata.
+Invisibly returns a list containing printed tables/metadata and (if requested) ICS results.
 }
 \description{
-Summarize an mrs fit
+Prints key diagnostics (kept periods / mixture table), and per-estimand point
+estimates with delete-1 cluster jackknife SEs and t-based confidence intervals
+(df = I - 1). Optionally prints an ICS linear-contrast F-test.
+}
+\examples{
+\donttest{
+data(sw_c)
+dat <- sw_c[sw_c$cluster \%in\% sort(unique(sw_c$cluster))[1:6], ]
+
+fit <- mrstdlcrt_fit(
+  data = dat,
+  formula = y ~ trt + factor(period) + x1 + x2 + (1 | cluster),
+  cluster_id = "cluster", period = "period", trt = "trt",
+  method = "lmer", family = "gaussian"
+)
+
+summary(fit, show_counts = FALSE, ics = "none")
+}
 }

@@ -2,7 +2,7 @@
 % Please edit documentation in R/mrstdlcrt.R
 \name{plot.mrs}
 \alias{plot.mrs}
-\title{Plot method for mrs objects}
+\title{Plot estimates from an mrs fit}
 \usage{
 \method{plot}{mrs}(x, level = 0.95, estimand = NULL, point_size = 2.8, ...)
 }
@@ -11,15 +11,31 @@
 
 \item{level}{Confidence level.}
 
-\item{estimand}{Subset of estimands to plot.}
+\item{estimand}{Optional subset of estimands to plot.}
 
 \item{point_size}{Point size.}
 
 \item{...}{Unused.}
 }
 \value{
-ggplot object invisibly.
+Invisibly returns a \code{ggplot2} object.
 }
 \description{
-Plot method for mrs objects
+Plots unadjusted vs adjusted estimates with t-based confidence intervals
+computed from delete-1 cluster jackknife SEs (df = I - 1). Facets by estimand.
+}
+\examples{
+\donttest{
+data(sw_c)
+dat <- sw_c[sw_c$cluster \%in\% sort(unique(sw_c$cluster))[1:6], ]
+
+fit <- mrstdlcrt_fit(
+  data = dat,
+  formula = y ~ trt + factor(period) + x1 + x2 + (1 | cluster),
+  cluster_id = "cluster", period = "period", trt = "trt",
+  method = "lmer", family = "gaussian"
+)
+
+plot(fit)
+}
 }

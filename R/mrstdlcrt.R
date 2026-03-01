@@ -1,4 +1,5 @@
 #' @importFrom rlang .data
+#' @importFrom MASS ginv
 NULL
 
 
@@ -516,22 +517,241 @@ mrs_fit_core <- function(
 }
 
 # =============================================================================
+# ICS testing utilities
+# =============================================================================
+
+mrs_valid_estimands <- function() c("h-iATE","h-cATE","v-iATE","v-cATE")
+
+mrs_C_global <- function(valid = mrs_valid_estimands()) {
+  C <- rbind(
+    c( 1, -1,  0,  0),
+    c( 0,  0,  1, -1),
+    c( 1,  0, -1,  0)
+  )
+  colnames(C) <- valid
+  C
+}
+
+# Build C for "all equal within set": baseline - others
+mrs_C_equal_set <- function(set, valid = mrs_valid_estimands()) {
+  set <- intersect(set, valid)
+  if (length(set) < 2) stop("ics equal-set must contain at least 2 valid estimands.")
+  base <- set[1]
+  others <- set[-1]
+  C <- matrix(0, nrow = length(others), ncol = length(valid),
+              dimnames = list(NULL, valid))
+  for (r in seq_along(others)) {
+    C[r, base]   <-  1
+    C[r, others[r]] <- -1
+  }
+  C
+}
+
+# Build C from pairs list: each row is e[a] - e[b]
+mrs_C_pairs <- function(pairs, valid = mrs_valid_estimands()) {
+  if (!length(pairs)) stop("ics$pairs must be a non-empty list of length-2 character vectors.")
+  C <- matrix(0, nrow = length(pairs), ncol = length(valid),
+              dimnames = list(NULL, valid))
+  for (i in seq_along(pairs)) {
+    pr <- pairs[[i]]
+    if (length(pr) != 2) stop("Each element of ics$pairs must have length 2.")
+    a <- pr[1]; b <- pr[2]
+    if (!(a %in% valid) || !(b %in% valid)) stop("Invalid estimand name in ics$pairs.")
+    C[i, a] <-  1
+    C[i, b] <- -1
+  }
+  C
+}
+
+# Coerce user input into a contrast matrix C with 4 columns (valid order)
+mrs_build_C <- function(ics, valid = mrs_valid_estimands()) {
+  # default
+  if (is.null(ics) || identical(ics, "global")) return(mrs_C_global(valid))
+
+  # "none" disables
+  if (identical(ics, "none") || identical(ics, FALSE)) return(NULL)
+
+  # character vector -> equality within that set
+  if (is.character(ics) && length(ics) >= 2) {
+    return(mrs_C_equal_set(ics, valid))
+  }
+
+  # list spec
+  if (is.list(ics)) {
+    if (!is.null(ics$C)) ics <- ics$C
+    else if (!is.null(ics$pairs)) return(mrs_C_pairs(ics$pairs, valid))
+    else if (!is.null(ics$equal)) return(mrs_C_equal_set(ics$equal, valid))
+    else stop("ics list must contain one of: $pairs, $equal, or $C.")
+  }
+
+  # numeric matrix -> align columns
+  if (is.matrix(ics) && is.numeric(ics)) {
+    C <- ics
+    if (!is.null(colnames(C))) {
+      miss <- setdiff(valid, colnames(C))
+      extra <- setdiff(colnames(C), valid)
+      if (length(extra)) stop("ics matrix has invalid column names: ", paste(extra, collapse = ", "))
+      if (length(miss)) {
+        # add missing columns as zeros
+        C2 <- matrix(0, nrow = nrow(C), ncol = length(valid),
+                     dimnames = list(NULL, valid))
+        C2[, colnames(C)] <- C
+        C <- C2
+      } else {
+        C <- C[, valid, drop = FALSE]
+      }
+    } else {
+      if (ncol(C) != length(valid)) stop("ics matrix must have 4 columns (or named columns).")
+      colnames(C) <- valid
+    }
+    return(C)
+  }
+
+  stop("Unrecognized ics specification. Use 'global', 'none', a character vector, a list, or a numeric matrix.")
+}
+
+# Compute F test with robust inversion
+mrs_ics_Ftest <- function(tau_hat, V_hat, C, df2, tol = 1e-10) {
+  if (is.null(C)) return(NULL)
+
+  Ct <- as.matrix(C %*% tau_hat)
+  S  <- C %*% V_hat %*% t(C)
+
+  # rank of S determines df1
+  p <- qr(S, tol = tol)$rank
+  if (p < 1L) {
+    return(list(F = NA_real_, df1 = 0L, df2 = df2, p_value = NA_real_,
+                note = "Contrast covariance is rank 0; cannot test."))
+  }
+
+  invS <- tryCatch(
+    solve(S),
+    error = function(e) {
+      if (!requireNamespace("MASS", quietly = TRUE)) stop("Need MASS for ginv fallback.")
+      MASS::ginv(S, tol = tol)
+    }
+  )
+
+  quad <- as.numeric(t(Ct) %*% invS %*% Ct)
+  F <- quad / p
+  pval <- stats::pf(F, df1 = p, df2 = df2, lower.tail = FALSE)
+
+  list(F = F, df1 = p, df2 = df2, p_value = pval, note = NULL)
+}
+
+
+# =============================================================================
 # Public API
 # =============================================================================
 
-#' Fit model-robust standardization for longitudinal CRTs
+#' Model-robust standardization for longitudinal cluster-randomized trials
 #'
-#' @param data data.frame with outcome, treatment, period, cluster, covariates.
-#' @param formula model formula; may include interactions and random effects.
-#' @param cluster_id cluster id column name.
-#' @param period period column name.
-#' @param trt treatment column name (0/1).
-#' @param method "gee","lmer","glmer".
-#' @param family "gaussian","binomial".
-#' @param corstr gee correlation.
-#' @param scale For binomial: "RD","RR","OR" (RR/OR are on log scale).
+#' Fits *unadjusted* and *augmented* (model-robust standardization) estimators for
+#' four longitudinal cluster-randomized trial (L-CRT) estimands, with inference based
+#' on leave-one-cluster-out (delete-1) jackknife standard errors.
 #'
-#' @return Object of class "mrs".
+#' The four supported estimands are:
+#' \describe{
+#'   \item{h-iATE}{Horizontal individual average treatment effect (individual-weighted within each period).}
+#'   \item{h-cATE}{Horizontal cluster average treatment effect (cluster-weighted within each period).}
+#'   \item{v-iATE}{Vertical individual average treatment effect (period-weighted; individuals weighted within period).}
+#'   \item{v-cATE}{Vertical cluster-period average treatment effect (period-weighted; cluster-period cells equally weighted within period).}
+#' }
+#'
+#' For each estimand, the function returns point estimates under:
+#' \enumerate{
+#'   \item an unadjusted estimator based on cluster-period means, and
+#'   \item an augmented estimator that combines model-based counterfactual predictions with
+#'         a design-based correction term (model-robust standardization).
+#' }
+#'
+#' @details
+#' \strong{Data structure.} The input \code{data} must contain:
+#' (i) a cluster identifier \code{cluster_id}, (ii) a period identifier \code{period},
+#' (iii) a binary treatment indicator \code{trt} coded as 0/1 (or coercible to 0/1),
+#' and (iv) the outcome appearing on the left-hand side of \code{formula}.
+#'
+#' \strong{Treatment must be constant within cluster-period.} Within each
+#' \code{(cluster, period)} cell, \code{trt} is required to be constant; otherwise the
+#' function errors and prints example problematic cells.
+#'
+#' \strong{Automatic period inclusion (mixture rule).} Marginal means and treatment
+#' contrasts are aggregated using only “mixed” periods—periods in which both treated
+#' and control clusters are observed. Periods with all clusters in the same arm
+#' contribute no information to between-arm contrasts and are excluded automatically.
+#'
+#' \strong{Working model options.}
+#' \describe{
+#'   \item{\code{method = "lmer"}}{Linear mixed model via \pkg{lme4} for continuous outcomes.}
+#'   \item{\code{method = "glmer"}}{Logistic mixed model via \pkg{lme4} for binary outcomes.}
+#'   \item{\code{method = "gee"}}{Generalized estimating equations via \pkg{gee}. Random-effects
+#'   terms in \code{formula} (e.g., \code{(1|cluster)}) are ignored automatically.}
+#' }
+#'
+#' For \code{family = "binomial"}, treatment effects can be reported on the risk-difference
+#' scale (\code{scale = "RD"}), log risk-ratio scale (\code{scale = "RR"}), or log odds-ratio
+#' scale (\code{scale = "OR"}). For \code{family = "gaussian"}, effects are mean differences
+#' (and \code{scale} is ignored).
+#'
+#' \strong{Inference.} Standard errors are computed using a delete-1 cluster jackknife:
+#' refit the procedure leaving out one cluster at a time, compute the jackknife covariance,
+#' and report per-estimand jackknife SEs. Downstream methods \code{\link[=summary.mrs]{summary}}
+#' and \code{\link[=plot.mrs]{plot}} use \code{t}-critical values with \code{df = I - 1},
+#' where \code{I} is the number of clusters.
+#'
+#' @param data A \code{data.frame} containing the outcome, \code{trt}, \code{period},
+#'   \code{cluster_id}, and any covariates appearing in \code{formula}.
+#' @param formula A model formula for the working model. May include interactions and (for
+#'   \code{"lmer"}/\code{"glmer"}) random effects terms. For \code{"gee"}, random effects
+#'   terms are removed prior to fitting.
+#' @param cluster_id Character string giving the cluster identifier column name.
+#' @param period Character string giving the period identifier column name. May be numeric,
+#'   integer, or a factor; ordering is taken from the natural order of the column.
+#' @param trt Character string giving the binary treatment column name (0/1).
+#' @param method Working model fitting method: \code{"gee"}, \code{"lmer"}, or \code{"glmer"}.
+#' @param family Outcome family: \code{"gaussian"} for continuous outcomes or \code{"binomial"}
+#'   for binary outcomes.
+#' @param corstr Correlation structure passed to \code{\link[gee]{gee}} when \code{method = "gee"}
+#'   (e.g., \code{"independence"}, \code{"exchangeable"}, \code{"ar1"}).
+#' @param scale For \code{family = "binomial"} only: \code{"RD"} (risk difference),
+#'   \code{"RR"} (log risk ratio), or \code{"OR"} (log odds ratio).
+#'
+#' @return An object of class \code{"mrs"} with components:
+#' \describe{
+#'   \item{\code{estimates}}{A tibble of unadjusted and adjusted point estimates for the four estimands.}
+#'   \item{\code{jk_se}}{A tibble of corresponding delete-1 cluster jackknife standard errors.}
+#'   \item{\code{jk_cov_unadj}, \code{jk_cov_aug}}{Jackknife covariance matrices for unadjusted and adjusted estimators.}
+#'   \item{\code{reps}}{Internal components used for fitting and aggregation (including kept periods and mixture table).}
+#'   \item{\code{meta}}{Metadata: call, method/family/scale, kept periods, cluster/period counts, etc.}
+#' }
+#' The class has \code{\link[=print.mrs]{print}}, \code{\link[=summary.mrs]{summary}},
+#' and \code{\link[=plot.mrs]{plot}} methods.
+#'
+#' @references
+#' Fang, X. and Li, F. (2025). Model-Robust Standardization for Longitudinal Cluster-Randomized Trials.
+#' arXiv:2507.17190.
+#'
+#' @examples
+#' data(sw_c)
+#'
+#' # Keep the example fast for R CMD check: use a small subset of clusters
+#' cl_keep <- sort(unique(sw_c$cluster))[1:6]
+#' dat <- sw_c[sw_c$cluster %in% cl_keep, ]
+#'
+#' fit <- mrstdlcrt_fit(
+#'   data = dat,
+#'   formula = y ~ trt + factor(period) + x1 + x2 + (1 | cluster),
+#'   cluster_id = "cluster",
+#'   period = "period",
+#'   trt = "trt",
+#'   method = "lmer",
+#'   family = "gaussian"
+#' )
+#'
+#' fit
+#' summary(fit, show_counts = FALSE, ics = "none")
+#' plot(fit)
+#'
 #' @export
 mrstdlcrt_fit <- function(
     data, formula,
@@ -664,21 +884,59 @@ print.mrs <- function(x, ...) {
 
 #' Summarize an mrs fit
 #'
+#' Prints key diagnostics (kept periods / mixture table), and per-estimand point
+#' estimates with delete-1 cluster jackknife SEs and t-based confidence intervals
+#' (df = I - 1). Optionally prints an ICS linear-contrast F-test.
+#'
 #' @param object An object of class \code{"mrs"}.
-#' @param level Confidence level.
-#' @param estimand Optional subset of estimands.
+#' @param level Confidence level for Wald-type confidence intervals.
+#' @param estimand Optional subset of estimands to print.
 #' @param digits Digits to print.
-#' @param show_counts Print counts tables.
-#' @param ... Unused.
-#' @return Invisibly returns a list of printed tables and metadata.
+#' @param show_counts If \code{TRUE}, print aggregation counts tables.
+#' @param ics ICS test specification. Use \code{"global"} (default) or \code{"none"} to disable.
+#'   You may also pass a character vector, list spec, or numeric contrast matrix.
+#' @param ics_method Which covariance to use for ICS test: \code{"both"}, \code{"unadjusted"}, \code{"adjusted"}.
+#' @param ics_tol Numerical tolerance for rank / generalized inverse.
+#' @param ... Unused (accepts \code{method_type=} as alias for \code{ics_method=}).
+#'
+#' @return Invisibly returns a list containing printed tables/metadata and (if requested) ICS results.
 #' @export
+#'
+#' @examples
+#' \donttest{
+#' data(sw_c)
+#' dat <- sw_c[sw_c$cluster %in% sort(unique(sw_c$cluster))[1:6], ]
+#'
+#' fit <- mrstdlcrt_fit(
+#'   data = dat,
+#'   formula = y ~ trt + factor(period) + x1 + x2 + (1 | cluster),
+#'   cluster_id = "cluster", period = "period", trt = "trt",
+#'   method = "lmer", family = "gaussian"
+#' )
+#'
+#' summary(fit, show_counts = FALSE, ics = "none")
+#' }
 summary.mrs <- function(object,
                         level = 0.95,
                         estimand = NULL,
                         digits = 6,
                         show_counts = TRUE,
+                        ics = "global",
+                        ics_method = c("both","unadjusted","adjusted"),
+                        ics_tol = 1e-10,
                         ...) {
   stopifnot(inherits(object, "mrs"))
+
+  dots <- list(...)
+
+  # Back-compat / user convenience: allow method_type="adjusted" as alias for ics_method
+  if (!is.null(dots$method_type) && is.null(dots$ics_method)) {
+    ics_method <- dots$method_type
+  }
+  # Also accept ics_method passed via ...
+  if (!is.null(dots$ics_method)) {
+    ics_method <- dots$ics_method
+  }
 
   est  <- object$estimates
   se   <- object$jk_se
@@ -715,7 +973,7 @@ summary.mrs <- function(object,
 
   if (!is.null(reps$period_mix_table) && nrow(reps$period_mix_table)) {
     cat("Period mixture table (min/max of Z_ij by period)\n")
-    cat(rep("-", 72), "\n", sep = "")
+    cat(rep("-", 50), "\n", sep = "")
     print(reps$period_mix_table)
     cat("\n")
   }
@@ -723,17 +981,191 @@ summary.mrs <- function(object,
   if (isTRUE(show_counts) && !is.null(reps$counts)) {
     if (!is.null(reps$counts$period) && nrow(reps$counts$period)) {
       cat("Counts used in aggregation (kept periods only)\n")
-      cat(rep("-", 72), "\n", sep = "")
+      cat(rep("-", 50), "\n", sep = "")
       print(reps$counts$period)
       cat("\n")
     }
     if (!is.null(reps$counts$cluster) && nrow(reps$counts$cluster)) {
       cat("Per-cluster counts (kept periods only)\n")
-      cat(rep("-", 72), "\n", sep = "")
+      cat(rep("-", 50), "\n", sep = "")
       print(reps$counts$cluster)
       cat("\n")
     }
   }
+
+  # =============================================================================
+  # ICS test helpers
+  # =============================================================================
+
+  C_global <- function() {
+    C <- rbind(
+      c( 1, -1,  0,  0),
+      c( 0,  0,  1, -1),
+      c( 1,  0, -1,  0)
+    )
+    colnames(C) <- valid
+    C
+  }
+
+  C_equal_set <- function(set) {
+    set <- intersect(set, valid)
+    if (length(set) < 2) stop("ics equal-set must contain at least 2 valid estimands.")
+    base <- set[1]
+    others <- set[-1]
+    C <- matrix(0, nrow = length(others), ncol = length(valid),
+                dimnames = list(NULL, valid))
+    for (r in seq_along(others)) {
+      C[r, base] <-  1
+      C[r, others[r]] <- -1
+    }
+    C
+  }
+
+  C_pairs <- function(pairs) {
+    if (!length(pairs)) stop("ics$pairs must be a non-empty list of length-2 character vectors.")
+    C <- matrix(0, nrow = length(pairs), ncol = length(valid),
+                dimnames = list(NULL, valid))
+    for (i in seq_along(pairs)) {
+      pr <- pairs[[i]]
+      if (length(pr) != 2) stop("Each element of ics$pairs must have length 2.")
+      a <- pr[1]; b <- pr[2]
+      if (!(a %in% valid) || !(b %in% valid)) stop("Invalid estimand name in ics$pairs.")
+      C[i, a] <-  1
+      C[i, b] <- -1
+    }
+    C
+  }
+
+  build_C <- function(ics_spec) {
+    if (is.null(ics_spec) || identical(ics_spec, "global")) return(C_global())
+    if (identical(ics_spec, "none") || identical(ics_spec, FALSE)) return(NULL)
+
+    if (is.character(ics_spec) && length(ics_spec) >= 2) {
+      return(C_equal_set(ics_spec))
+    }
+
+    if (is.list(ics_spec)) {
+      if (!is.null(ics_spec$C)) ics_spec <- ics_spec$C
+      else if (!is.null(ics_spec$pairs)) return(C_pairs(ics_spec$pairs))
+      else if (!is.null(ics_spec$equal)) return(C_equal_set(ics_spec$equal))
+      else stop("ics list must contain one of: $pairs, $equal, or $C.")
+    }
+
+    if (is.matrix(ics_spec) && is.numeric(ics_spec)) {
+      C <- ics_spec
+      if (!is.null(colnames(C))) {
+        extra <- setdiff(colnames(C), valid)
+        if (length(extra)) stop("ics matrix has invalid column names: ", paste(extra, collapse = ", "))
+        miss <- setdiff(valid, colnames(C))
+        if (length(miss)) {
+          C2 <- matrix(0, nrow = nrow(C), ncol = length(valid),
+                       dimnames = list(NULL, valid))
+          C2[, colnames(C)] <- C
+          C <- C2
+        } else {
+          C <- C[, valid, drop = FALSE]
+        }
+      } else {
+        if (ncol(C) != length(valid)) stop("ics matrix must have 4 columns (or named columns).")
+        colnames(C) <- valid
+      }
+      return(C)
+    }
+
+    stop("Unrecognized ics specification. Use 'global', 'none', a character vector, a list, or a numeric matrix.")
+  }
+
+  ginv_svd <- function(A, tol = 1e-10) {
+    s <- svd(A)
+    if (!length(s$d)) return(matrix(0, nrow(A), ncol(A)))
+    keep <- s$d > tol * max(s$d)
+    if (!any(keep)) return(matrix(0, nrow(A), ncol(A)))
+    Dinv <- diag(ifelse(keep, 1/s$d, 0), nrow = length(s$d))
+    s$v %*% Dinv %*% t(s$u)
+  }
+
+  ics_Ftest <- function(tau_hat, V_hat, C, df2, tol = 1e-10) {
+    Ct <- as.matrix(C %*% tau_hat)
+    S  <- C %*% V_hat %*% t(C)
+
+    p <- qr(S, tol = tol)$rank
+    if (p < 1L) {
+      return(list(F = NA_real_, df1 = 0L, df2 = df2, p_value = NA_real_,
+                  note = "Contrast covariance is rank 0; cannot test."))
+    }
+
+    invS <- tryCatch(solve(S), error = function(e) ginv_svd(S, tol = tol))
+    quad <- as.numeric(t(Ct) %*% invS %*% Ct)
+    F <- quad / p
+    pval <- stats::pf(F, df1 = p, df2 = df2, lower.tail = FALSE)
+
+    list(F = F, df1 = p, df2 = df2, p_value = pval, note = NULL)
+  }
+
+  # =============================================================================
+  # ICS hypothesis testing (optional)
+  # =============================================================================
+
+  ics_method <- match.arg(ics_method)
+  C <- build_C(ics)
+
+  ics_results <- NULL
+
+  if (!is.null(C)) {
+    get_tau <- function(mt) {
+      row <- est[est$method_type == mt, valid, drop = FALSE]
+      if (!nrow(row)) stop("Could not find method_type='", mt, "' in object$estimates.")
+      as.numeric(row[1, ])
+    }
+
+    methods_to_do <- switch(
+      ics_method,
+      "both"       = c("unadjusted","adjusted"),
+      "unadjusted" = "unadjusted",
+      "adjusted"   = "adjusted"
+    )
+
+    tests <- list()
+    for (mt in methods_to_do) {
+      tau_hat <- get_tau(mt)
+      V_hat <- if (mt == "unadjusted") object$jk_cov_unadj else object$jk_cov_aug
+      tests[[mt]] <- ics_Ftest(tau_hat, V_hat, C, df2 = df, tol = ics_tol)
+    }
+
+    cat("ICS hypothesis test (linear-contrast F test)\n")
+    cat(rep("-", 50), "\n", sep = "")
+    cat("Contrasts (rows of C):\n")
+    print(C)
+    cat("\n")
+
+    out_tab <- do.call(rbind, lapply(names(tests), function(mt) {
+      tt <- tests[[mt]]
+      data.frame(
+        method_type = mt,
+        df1 = tt$df1,
+        df2 = tt$df2,
+        F = tt$F,
+        p_value = tt$p_value,
+        note = ifelse(is.null(tt$note), "", tt$note),
+        row.names = NULL,
+        check.names = FALSE
+      )
+    }))
+
+    # round numeric columns only (avoid round() error on method_type/note)
+    out_tab_print <- out_tab
+    num_cols <- vapply(out_tab_print, is.numeric, logical(1))
+    out_tab_print[num_cols] <- lapply(out_tab_print[num_cols], round, digits = digits)
+
+    print(out_tab_print)
+    cat("\n")
+
+    ics_results <- list(C = C, table = out_tab, tests = tests)
+  }
+
+  # =============================================================================
+  # Per-estimand tables
+  # =============================================================================
 
   se_col <- function(nm) paste0("SE(", nm, ")")
   ratio_scale <- (meta$family == "binomial" && meta$scale %in% c("RR","OR"))
@@ -783,19 +1215,41 @@ summary.mrs <- function(object,
     df = df,
     crit = crit,
     meta = meta,
+    ics = ics_results,
     tables = printed
   ))
 }
 
-#' Plot method for mrs objects
+
+
+#' Plot estimates from an mrs fit
+#'
+#' Plots unadjusted vs adjusted estimates with t-based confidence intervals
+#' computed from delete-1 cluster jackknife SEs (df = I - 1). Facets by estimand.
 #'
 #' @param x An object of class \code{"mrs"}.
 #' @param level Confidence level.
-#' @param estimand Subset of estimands to plot.
+#' @param estimand Optional subset of estimands to plot.
 #' @param point_size Point size.
 #' @param ... Unused.
-#' @return ggplot object invisibly.
+#'
+#' @return Invisibly returns a \code{ggplot2} object.
 #' @export
+#'
+#' @examples
+#' \donttest{
+#' data(sw_c)
+#' dat <- sw_c[sw_c$cluster %in% sort(unique(sw_c$cluster))[1:6], ]
+#'
+#' fit <- mrstdlcrt_fit(
+#'   data = dat,
+#'   formula = y ~ trt + factor(period) + x1 + x2 + (1 | cluster),
+#'   cluster_id = "cluster", period = "period", trt = "trt",
+#'   method = "lmer", family = "gaussian"
+#' )
+#'
+#' plot(fit)
+#' }
 plot.mrs <- function(x, level = 0.95, estimand = NULL, point_size = 2.8, ...) {
   if (!requireNamespace("ggplot2", quietly = TRUE))
     stop("Package 'ggplot2' is required for plotting.", call. = FALSE)

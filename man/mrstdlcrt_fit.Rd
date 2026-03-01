@@ -2,7 +2,7 @@
 % Please edit documentation in R/mrstdlcrt.R
 \name{mrstdlcrt_fit}
 \alias{mrstdlcrt_fit}
-\title{Fit model-robust standardization for longitudinal CRTs}
+\title{Model-robust standardization for longitudinal cluster-randomized trials}
 \usage{
 mrstdlcrt_fit(
   data,
@@ -17,27 +17,120 @@ mrstdlcrt_fit(
 )
 }
 \arguments{
-\item{data}{data.frame with outcome, treatment, period, cluster, covariates.}
+\item{data}{A \code{data.frame} containing the outcome, \code{trt}, \code{period},
+\code{cluster_id}, and any covariates appearing in \code{formula}.}
 
-\item{formula}{model formula; may include interactions and random effects.}
+\item{formula}{A model formula for the working model. May include interactions and (for
+\code{"lmer"}/\code{"glmer"}) random effects terms. For \code{"gee"}, random effects
+terms are removed prior to fitting.}
 
-\item{cluster_id}{cluster id column name.}
+\item{cluster_id}{Character string giving the cluster identifier column name.}
 
-\item{period}{period column name.}
+\item{period}{Character string giving the period identifier column name. May be numeric,
+integer, or a factor; ordering is taken from the natural order of the column.}
 
-\item{trt}{treatment column name (0/1).}
+\item{trt}{Character string giving the binary treatment column name (0/1).}
 
-\item{method}{"gee","lmer","glmer".}
+\item{method}{Working model fitting method: \code{"gee"}, \code{"lmer"}, or \code{"glmer"}.}
 
-\item{family}{"gaussian","binomial".}
+\item{family}{Outcome family: \code{"gaussian"} for continuous outcomes or \code{"binomial"}
+for binary outcomes.}
 
-\item{corstr}{gee correlation.}
+\item{corstr}{Correlation structure passed to \code{\link[gee]{gee}} when \code{method = "gee"}
+(e.g., \code{"independence"}, \code{"exchangeable"}, \code{"ar1"}).}
 
-\item{scale}{For binomial: "RD","RR","OR" (RR/OR are on log scale).}
+\item{scale}{For \code{family = "binomial"} only: \code{"RD"} (risk difference),
+\code{"RR"} (log risk ratio), or \code{"OR"} (log odds ratio).}
 }
 \value{
-Object of class "mrs".
+An object of class \code{"mrs"} with components:
+\describe{
+\item{\code{estimates}}{A tibble of unadjusted and adjusted point estimates for the four estimands.}
+\item{\code{jk_se}}{A tibble of corresponding delete-1 cluster jackknife standard errors.}
+\item{\code{jk_cov_unadj}, \code{jk_cov_aug}}{Jackknife covariance matrices for unadjusted and adjusted estimators.}
+\item{\code{reps}}{Internal components used for fitting and aggregation (including kept periods and mixture table).}
+\item{\code{meta}}{Metadata: call, method/family/scale, kept periods, cluster/period counts, etc.}
+}
+The class has \code{\link[=print.mrs]{print}}, \code{\link[=summary.mrs]{summary}},
+and \code{\link[=plot.mrs]{plot}} methods.
 }
 \description{
-Fit model-robust standardization for longitudinal CRTs
+Fits \emph{unadjusted} and \emph{augmented} (model-robust standardization) estimators for
+four longitudinal cluster-randomized trial (L-CRT) estimands, with inference based
+on leave-one-cluster-out (delete-1) jackknife standard errors.
+}
+\details{
+The four supported estimands are:
+\describe{
+\item{h-iATE}{Horizontal individual average treatment effect (individual-weighted within each period).}
+\item{h-cATE}{Horizontal cluster average treatment effect (cluster-weighted within each period).}
+\item{v-iATE}{Vertical individual average treatment effect (period-weighted; individuals weighted within period).}
+\item{v-cATE}{Vertical cluster-period average treatment effect (period-weighted; cluster-period cells equally weighted within period).}
+}
+
+For each estimand, the function returns point estimates under:
+\enumerate{
+\item an unadjusted estimator based on cluster-period means, and
+\item an augmented estimator that combines model-based counterfactual predictions with
+a design-based correction term (model-robust standardization).
+}
+
+\strong{Data structure.} The input \code{data} must contain:
+(i) a cluster identifier \code{cluster_id}, (ii) a period identifier \code{period},
+(iii) a binary treatment indicator \code{trt} coded as 0/1 (or coercible to 0/1),
+and (iv) the outcome appearing on the left-hand side of \code{formula}.
+
+\strong{Treatment must be constant within cluster-period.} Within each
+\code{(cluster, period)} cell, \code{trt} is required to be constant; otherwise the
+function errors and prints example problematic cells.
+
+\strong{Automatic period inclusion (mixture rule).} Marginal means and treatment
+contrasts are aggregated using only “mixed” periods—periods in which both treated
+and control clusters are observed. Periods with all clusters in the same arm
+contribute no information to between-arm contrasts and are excluded automatically.
+
+\strong{Working model options.}
+\describe{
+\item{\code{method = "lmer"}}{Linear mixed model via \pkg{lme4} for continuous outcomes.}
+\item{\code{method = "glmer"}}{Logistic mixed model via \pkg{lme4} for binary outcomes.}
+\item{\code{method = "gee"}}{Generalized estimating equations via \pkg{gee}. Random-effects
+terms in \code{formula} (e.g., \code{(1|cluster)}) are ignored automatically.}
+}
+
+For \code{family = "binomial"}, treatment effects can be reported on the risk-difference
+scale (\code{scale = "RD"}), log risk-ratio scale (\code{scale = "RR"}), or log odds-ratio
+scale (\code{scale = "OR"}). For \code{family = "gaussian"}, effects are mean differences
+(and \code{scale} is ignored).
+
+\strong{Inference.} Standard errors are computed using a delete-1 cluster jackknife:
+refit the procedure leaving out one cluster at a time, compute the jackknife covariance,
+and report per-estimand jackknife SEs. Downstream methods \code{\link[=summary.mrs]{summary}}
+and \code{\link[=plot.mrs]{plot}} use \code{t}-critical values with \code{df = I - 1},
+where \code{I} is the number of clusters.
+}
+\examples{
+data(sw_c)
+
+# Keep the example fast for R CMD check: use a small subset of clusters
+cl_keep <- sort(unique(sw_c$cluster))[1:6]
+dat <- sw_c[sw_c$cluster \%in\% cl_keep, ]
+
+fit <- mrstdlcrt_fit(
+  data = dat,
+  formula = y ~ trt + factor(period) + x1 + x2 + (1 | cluster),
+  cluster_id = "cluster",
+  period = "period",
+  trt = "trt",
+  method = "lmer",
+  family = "gaussian"
+)
+
+fit
+summary(fit, show_counts = FALSE, ics = "none")
+plot(fit)
+
+}
+\references{
+Fang, X. and Li, F. (2025). Model-Robust Standardization for Longitudinal Cluster-Randomized Trials.
+arXiv:2507.17190.
 }
